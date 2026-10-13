@@ -2,6 +2,8 @@
 
 An [opencode](https://opencode.ai) TUI plugin that shows your **GitHub Copilot premium quota** in the session sidebar, so you know whether you will make it to the end of the month.
 
+Works with **opencode 1.x** and **opencode 2.x** (same package).
+
 ```
 Copilot (business)
 ██████████████████░░░░░░
@@ -23,12 +25,35 @@ End-of-month projection 17 917
 
 ## Requirements
 
-- opencode **≥ 1.17** (TUI plugin support)
+- opencode **≥ 1.17** (1.x TUI plugins) or **2.x**
 - The `github-copilot` provider connected in opencode (`/connect` → GitHub Copilot)
 
 ## Installation
 
-Add the plugin to your **TUI** config, `~/.config/opencode/tui.json` (global) or `.opencode/tui.json` (project). This is a separate file from `opencode.json`:
+### opencode 2.x
+
+Add the plugin to the CLI settings, `~/.config/opencode/cli.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["opencode-copilot-quota"]
+}
+```
+
+With options:
+
+```json
+{
+  "plugins": [{ "package": "opencode-copilot-quota", "options": { "language": "fr" } }]
+}
+```
+
+Valid edits of `cli.json` are reloaded while the TUI is running.
+
+### opencode 1.x
+
+Add the plugin to the TUI config, `~/.config/opencode/tui.json` (global) or `.opencode/tui.json` (project). This is a separate file from `opencode.json`:
 
 ```json
 {
@@ -37,52 +62,60 @@ Add the plugin to your **TUI** config, `~/.config/opencode/tui.json` (global) or
 }
 ```
 
-Restart opencode. The block appears in the right sidebar of any session (toggle the sidebar with the `session.sidebar.toggle` keybind).
-
-### As a local file (without npm)
-
-Copy [`src/tui.tsx`](src/tui.tsx) anywhere (for example `~/.config/opencode/tui-plugins/copilot-quota.tsx`) and reference it by path. opencode compiles local `.tsx` files itself:
+With options (tuple form):
 
 ```json
 {
-  "plugin": ["./tui-plugins/copilot-quota.tsx"]
+  "plugin": [["opencode-copilot-quota", { "language": "fr" }]]
 }
 ```
+
+Restart opencode.
+
+The block appears in the right sidebar of any session (it is shown when the terminal is wide enough; on 1.x it can be toggled with the `session.sidebar.toggle` keybind).
+
+### Without npm
+
+Clone the repository, then reference the directory:
+
+- **opencode 2.x**: `"plugins": ["/path/to/opencode-copilot-quota"]` in `cli.json`, or put the clone in `~/.config/opencode/plugins/`. No build needed (the root `tui.ts` is loaded).
+- **opencode 1.x**: run `npm install && npm run build`, then `"plugin": ["/path/to/opencode-copilot-quota"]` in `tui.json`. Alternatively, reference the source file directly: `"plugin": ["/path/to/opencode-copilot-quota/src/tui.tsx"]`.
 
 ## Options
 
-Use the tuple form to pass options:
-
-```json
-{
-  "plugin": [["opencode-copilot-quota", { "language": "fr", "refreshMinutes": 10 }]]
-}
-```
-
-| Option           | Default       | Description                                                                       |
-| ---------------- | ------------- | --------------------------------------------------------------------------------- |
-| `language`       | auto (`en`)   | `"en"` or `"fr"`. Auto-detected from `LC_ALL` / `LC_MESSAGES` / `LANG` / `Intl`.  |
-| `refreshMinutes` | `5`           | Periodic refresh interval.                                                        |
-| `minGapSeconds`  | `30`          | Minimum delay between two refreshes triggered by session activity.                |
-| `order`          | `50`          | Position in the sidebar (lower = higher).                                         |
+| Option           | Default     | Description                                                                      |
+| ---------------- | ----------- | -------------------------------------------------------------------------------- |
+| `language`       | auto (`en`) | `"en"` or `"fr"`. Auto-detected from `LC_ALL` / `LC_MESSAGES` / `LANG` / `Intl`. |
+| `refreshMinutes` | `5`         | Periodic refresh interval.                                                       |
+| `minGapSeconds`  | `30`        | Minimum delay between two refreshes triggered by session activity.               |
+| `order`          | `50`        | Position in the sidebar, lower = higher (opencode 1.x only).                     |
 
 ## When is the data refreshed?
 
 1. When opencode starts
 2. Every `refreshMinutes`
-3. After each assistant response (`session.idle` event), at most once every `minGapSeconds`
+3. After each assistant response (`session.idle` on 1.x, `session.execution.succeeded` / `failed` on 2.x), at most once every `minGapSeconds`
 
 GitHub itself may take a little while to account for the latest requests, so the figure can lag by one or two responses. On network errors the last known value is kept.
 
 ## How it works
 
-The plugin reads the Copilot OAuth token that opencode already stores in `~/.local/share/opencode/auth.json` (or `$XDG_DATA_HOME/opencode/auth.json`) and calls:
+The plugin reuses the Copilot OAuth token that opencode already stores locally:
+
+| opencode | Location                                                                          |
+| -------- | --------------------------------------------------------------------------------- |
+| 1.x      | `~/.local/share/opencode/auth.json`                                               |
+| 2.x      | `credential` table of `~/.local/share/opencode/opencode.db` (opened read-only)    |
+
+`$XDG_DATA_HOME` and `$OPENCODE_DB` are honored. Both locations are tried, and the `COPILOT_QUOTA_TOKEN` environment variable overrides them. With opencode 2.x connected to a **remote** server, the credentials are not on your machine: set `COPILOT_QUOTA_TOKEN`.
+
+It then calls:
 
 ```
 GET https://api.github.com/copilot_internal/user
 ```
 
-It uses `quota_snapshots.premium_interactions` (`entitlement`, `remaining`, `credits_used`, `percent_remaining`, `overage_count`) and `quota_reset_date_utc`. The token is never sent anywhere else.
+and uses `quota_snapshots.premium_interactions` (`entitlement`, `remaining`, `credits_used`, `percent_remaining`, `overage_count`) and `quota_reset_date_utc`. The token is never sent anywhere else.
 
 The daily usage is `credits used / days elapsed since the period start`, and the projection extrapolates that rate to the reset date.
 
@@ -96,15 +129,14 @@ npm run typecheck
 npm run build      # compiles src/tui.tsx -> dist/tui.js
 ```
 
-opencode only applies its Solid JSX transform to local files, not to packages in `node_modules`, so the published package ships a precompiled `dist/tui.js` (Babel + `babel-preset-solid` in `universal` mode targeting `@opentui/solid`). At runtime, opencode resolves `@opentui/solid` and `solid-js` to its own copies, so the plugin has no runtime dependencies.
+A single module serves both plugin APIs. Its default export is `{ id, tui, setup }`:
 
-To try local changes, point your `tui.json` at the source file:
+- opencode 1.x calls `tui(api, options)` ([`@opencode-ai/plugin/tui`](https://www.npmjs.com/package/@opencode-ai/plugin))
+- opencode 2.x calls `setup(context)` ([`@opencode/plugin/tui`](https://www.npmjs.com/package/@opencode/plugin))
 
-```json
-{
-  "plugin": [["/absolute/path/to/opencode-copilot-quota/src/tui.tsx", { "language": "fr" }]]
-}
-```
+Each loader ignores the other key. Both adapters feed the same host-independent core (`start()` in [`src/tui.tsx`](src/tui.tsx)).
+
+opencode 1.x only applies its Solid JSX transform to local files, not to packages in `node_modules`, so the published package ships a precompiled `dist/tui.js` (Babel + `babel-preset-solid` in `universal` mode targeting `@opentui/solid`). At runtime, opencode resolves `@opentui/solid` and `solid-js` to its own copies, so the plugin has no runtime dependencies.
 
 ## License
 

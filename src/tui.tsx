@@ -1,8 +1,23 @@
+/**
+ * opencode-copilot-quota
+ *
+ * Shows the GitHub Copilot premium quota in the opencode session sidebar.
+ *
+ * One module, two hosts:
+ * - opencode 1.x loads `default.tui(api, options)`   (TUI plugin API v1)
+ * - opencode 2.x loads `default.setup(context)`      (CLI plugin API v2)
+ * Each loader ignores the other's key, so the same file works on both.
+ */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createSignal, Show } from "solid-js"
+import type { JSX } from "@opentui/solid"
+import type { RGBA } from "@opentui/core"
+import { createSignal, Show, type Accessor } from "solid-js"
+import { existsSync } from "fs"
 import { readFile } from "fs/promises"
 import { homedir } from "os"
-import { join } from "path"
+import { isAbsolute, join } from "path"
+
+const PLUGIN_ID = "copilot-quota"
 
 /* -------------------------------------------------------------------------- */
 /* Options                                                                    */
@@ -17,7 +32,7 @@ type Options = {
   minGapSeconds: number
   /** UI language (default: auto-detected from LANG / Intl, fallback "en") */
   language: Language
-  /** Sidebar slot order, lower = higher in the sidebar (default: 50) */
+  /** Sidebar slot order on opencode 1.x, lower = higher in the sidebar (default: 50) */
   order: number
 }
 
@@ -35,7 +50,7 @@ function detectLanguage(): Language {
   return "en"
 }
 
-function resolveOptions(raw: Record<string, unknown> | undefined): Options {
+function resolveOptions(raw: Readonly<Record<string, unknown>> | undefined): Options {
   const num = (v: unknown, def: number) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : def)
   const lang = raw?.language === "fr" || raw?.language === "en" ? (raw.language as Language) : detectLanguage()
   return {
@@ -83,6 +98,80 @@ const MESSAGES = {
   },
 } as const
 
+type Messages = (typeof MESSAGES)[Language]
+
+/* -------------------------------------------------------------------------- */
+/* Copilot token                                                              */
+/* -------------------------------------------------------------------------- */
+
+const COPILOT_IDS = ["github-copilot", "github-copilot-enterprise"]
+
+function dataDir() {
+  const base = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
+  return join(base, "opencode")
+}
+
+/** opencode 1.x: credentials live in `<data>/auth.json`. */
+async function tokenFromAuthFile(): Promise<string | undefined> {
+  try {
+    const auth = JSON.parse(await readFile(join(dataDir(), "auth.json"), "utf8"))
+    for (const id of COPILOT_IDS) {
+      const entry = auth?.[id]
+      const token = entry?.refresh || entry?.access || entry?.key
+      if (token) return token
+    }
+  } catch {}
+  return undefined
+}
+
+/** opencode 2.x: credentials live in the `credential` table of `<data>/opencode.db`. */
+async function tokenFromDatabase(): Promise<string | undefined> {
+  const configured = process.env.OPENCODE_DB
+  const file = configured ? (isAbsolute(configured) ? configured : join(dataDir(), configured)) : join(dataDir(), "opencode.db")
+  if (!existsSync(file)) return undefined
+  let sqlite: any
+  try {
+    // @ts-ignore -- Bun-only module (opencode runs on Bun); no types needed
+    sqlite = await import("bun:sqlite")
+  } catch {
+    return undefined
+  }
+  let db: any
+  try {
+    db = new sqlite.Database(file, { readonly: true })
+    const table = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credential'").get()
+    if (!table) return undefined
+    const placeholders = COPILOT_IDS.map(() => "?").join(", ")
+    const rows: Array<{ value: string }> = db
+      .query(
+        `SELECT value FROM credential WHERE integration_id IN (${placeholders}) ORDER BY active DESC, time_updated DESC`,
+      )
+      .all(...COPILOT_IDS)
+    for (const row of rows) {
+      const value = typeof row.value === "string" ? JSON.parse(row.value) : row.value
+      const token = value?.type === "oauth" ? value.refresh || value.access : value?.key
+      if (token) return token
+    }
+  } catch {
+  } finally {
+    try {
+      db?.close()
+    } catch {}
+  }
+  return undefined
+}
+
+async function readToken(preferDatabase: boolean): Promise<string | undefined> {
+  const env = process.env.COPILOT_QUOTA_TOKEN
+  if (env) return env
+  const sources = preferDatabase ? [tokenFromDatabase, tokenFromAuthFile] : [tokenFromAuthFile, tokenFromDatabase]
+  for (const source of sources) {
+    const token = await source()
+    if (token) return token
+  }
+  return undefined
+}
+
 /* -------------------------------------------------------------------------- */
 /* Copilot API                                                                */
 /* -------------------------------------------------------------------------- */
@@ -99,24 +188,16 @@ type Quota = {
 }
 
 class QuotaError extends Error {
-  constructor(public code: "noAuth" | "noQuota" | "http", message?: string) {
+  constructor(
+    public code: "noAuth" | "noQuota" | "http",
+    message?: string,
+  ) {
     super(message ?? code)
   }
 }
 
-function authPath() {
-  const data = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
-  return join(data, "opencode", "auth.json")
-}
-
-async function readToken(): Promise<string | undefined> {
-  const auth = JSON.parse(await readFile(authPath(), "utf8"))
-  const entry = auth["github-copilot"] ?? auth["github-copilot-enterprise"]
-  return entry?.refresh || entry?.access
-}
-
-async function fetchQuota(): Promise<Quota> {
-  const token = await readToken().catch(() => undefined)
+async function fetchQuota(preferDatabase: boolean): Promise<Quota> {
+  const token = await readToken(preferDatabase)
   if (!token) throw new QuotaError("noAuth")
   const res = await fetch("https://api.github.com/copilot_internal/user", {
     headers: {
@@ -173,13 +254,32 @@ function stats(q: Quota) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Plugin                                                                     */
+/* Host-independent core                                                      */
 /* -------------------------------------------------------------------------- */
 
-const tui: TuiPlugin = async (api, rawOptions) => {
-  const opts = resolveOptions(rawOptions as Record<string, unknown> | undefined)
+type Colors = {
+  text: RGBA
+  muted: RGBA
+  error: RGBA
+  warning: RGBA
+  success: RGBA
+}
+
+/** What the core needs from opencode, implemented once per plugin API version. */
+type Host = {
+  options: Readonly<Record<string, unknown>> | undefined
+  /** Where to look for the Copilot token first. */
+  preferDatabase: boolean
+  colors: () => Colors
+  /** Subscribes to "an assistant turn just finished"; returns an unsubscribe function. */
+  onTurnEnd: (handler: () => void) => () => void
+  /** Mounts the view in the session sidebar; returns an unmount function when the API provides one. */
+  mount: (render: () => JSX.Element, order: number) => (() => void) | void
+}
+
+function start(host: Host): () => void {
+  const opts = resolveOptions(host.options)
   const t = MESSAGES[opts.language]
-  const fmt = (n: number) => Math.round(n).toLocaleString(t.locale).replace(/\u202f|\u00a0/g, " ")
 
   const [quota, setQuota] = createSignal<Quota>()
   const [error, setError] = createSignal<string>()
@@ -192,7 +292,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     inflight = true
     last = Date.now()
     try {
-      setQuota(await fetchQuota())
+      setQuota(await fetchQuota(host.preferDatabase))
       setError(undefined)
     } catch (e: any) {
       setError(e instanceof QuotaError && e.code !== "http" ? t[e.code] : (e?.message ?? String(e)))
@@ -203,25 +303,37 @@ const tui: TuiPlugin = async (api, rawOptions) => {
 
   refresh(true)
   const timer = setInterval(() => refresh(true), opts.refreshMinutes * 60 * 1000)
-  const off = api.event.on("session.idle", () => refresh())
-  api.lifecycle.onDispose(() => {
+  const unsubscribe = host.onTurnEnd(() => refresh())
+  const unmount = host.mount(() => <QuotaView colors={host.colors} quota={quota} error={error} t={t} />, opts.order)
+
+  return () => {
     clearInterval(timer)
-    off()
-  })
+    unsubscribe()
+    unmount?.()
+  }
+}
 
-  const theme = () => api.theme.current
+function QuotaView(props: {
+  colors: () => Colors
+  quota: Accessor<Quota | undefined>
+  error: Accessor<string | undefined>
+  t: Messages
+}) {
+  const t = props.t
+  const c = () => props.colors()
+  const fmt = (n: number) => Math.round(n).toLocaleString(t.locale).replace(/\u202f|\u00a0/g, " ")
 
-  const View = () => (
+  return (
     <box flexDirection="column" flexShrink={0}>
-      <text fg={theme().text}>
+      <text fg={c().text}>
         <b>Copilot</b>
-        <Show when={quota()?.plan}>
-          <span style={{ fg: theme().textMuted }}> ({quota()!.plan})</span>
+        <Show when={props.quota()?.plan}>
+          <span style={{ fg: c().muted }}> ({props.quota()!.plan})</span>
         </Show>
       </text>
       <Show
-        when={quota()}
-        fallback={<text fg={error() ? theme().error : theme().textMuted}>{error() ?? t.loading}</text>}
+        when={props.quota()}
+        fallback={<text fg={props.error() ? c().error : c().muted}>{props.error() ?? t.loading}</text>}
       >
         {(q) => {
           const s = () => stats(q())
@@ -229,37 +341,37 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           const color = () => {
             const r = ratio()
             const expected = s().daysLeft / s().periodDays
-            if (r < 0.1) return theme().error
-            if (r < expected * 0.8) return theme().warning
-            return theme().success
+            if (r < 0.1) return c().error
+            if (r < expected * 0.8) return c().warning
+            return c().success
           }
           return (
-            <Show when={!q().unlimited} fallback={<text fg={theme().success}>{t.unlimited}</text>}>
+            <Show when={!q().unlimited} fallback={<text fg={c().success}>{t.unlimited}</text>}>
               <text>
                 <span style={{ fg: color() }}>{bar(ratio()).full}</span>
-                <span style={{ fg: theme().textMuted }}>{bar(ratio()).empty}</span>
+                <span style={{ fg: c().muted }}>{bar(ratio()).empty}</span>
               </text>
-              <text fg={theme().text}>
+              <text fg={c().text}>
                 {fmt(q().remaining)}{" "}
-                <span style={{ fg: theme().textMuted }}>
+                <span style={{ fg: c().muted }}>
                   / {fmt(q().entitlement)} {t.remaining(Math.round(q().percentRemaining))}
                 </span>
               </text>
-              <text fg={theme().textMuted}>
+              <text fg={c().muted}>
                 {t.reset} {q().resetAt.toLocaleDateString(t.locale, { day: "numeric", month: "short" })} ·{" "}
                 {Math.ceil(s().daysLeft)} {t.days}
               </text>
-              <text fg={theme().textMuted}>
-                {t.budget} <span style={{ fg: theme().text }}>{fmt(s().perDayBudget)}</span> · {t.usage}{" "}
-                <span style={{ fg: theme().text }}>{fmt(s().perDayUsed)}</span>
+              <text fg={c().muted}>
+                {t.budget} <span style={{ fg: c().text }}>{fmt(s().perDayBudget)}</span> · {t.usage}{" "}
+                <span style={{ fg: c().text }}>{fmt(s().perDayUsed)}</span>
               </text>
-              <text fg={s().projected > q().entitlement ? theme().warning : theme().textMuted}>
+              <text fg={s().projected > q().entitlement ? c().warning : c().muted}>
                 {s().projected > q().entitlement
                   ? t.runout(Math.floor(s().runoutDays))
                   : `${t.projection} ${fmt(s().projected)}`}
               </text>
               <Show when={q().overageCount > 0}>
-                <text fg={theme().warning}>
+                <text fg={c().warning}>
                   {t.overage}: {fmt(q().overageCount)}
                 </text>
               </Show>
@@ -269,20 +381,96 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       </Show>
     </box>
   )
+}
 
-  api.slots.register({
-    order: opts.order,
-    slots: {
-      sidebar_content() {
-        return <View />
-      },
+/* -------------------------------------------------------------------------- */
+/* opencode 1.x adapter (@opencode-ai/plugin/tui)                             */
+/* -------------------------------------------------------------------------- */
+
+const tui: TuiPlugin = async (api, options) => {
+  const stop = start({
+    options: options as Record<string, unknown> | undefined,
+    preferDatabase: false,
+    colors: () => {
+      const theme = api.theme.current
+      return {
+        text: theme.text,
+        muted: theme.textMuted,
+        error: theme.error,
+        warning: theme.warning,
+        success: theme.success,
+      }
     },
+    onTurnEnd: (handler) => api.event.on("session.idle", handler),
+    mount: (render, order) => {
+      api.slots.register({ order, slots: { sidebar_content: () => render() } })
+    },
+  })
+  api.lifecycle.onDispose(stop)
+}
+
+/* -------------------------------------------------------------------------- */
+/* opencode 2.x adapter (@opencode/plugin/tui)                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Minimal structural view of the v2 `Plugin.Context` actually used here, so the
+ * package does not depend on `@opencode/plugin`.
+ */
+type V2Feedback = { readonly base: RGBA }
+type V2Context = {
+  readonly options: Readonly<Record<string, unknown>>
+  readonly theme: {
+    readonly text: {
+      readonly base: RGBA
+      readonly muted: RGBA
+      readonly feedback: {
+        readonly error: V2Feedback
+        readonly warning: V2Feedback
+        readonly success: V2Feedback
+      }
+    }
+  }
+  readonly data: {
+    readonly on: (type: string, handler: (event: unknown) => void) => () => void
+  }
+  readonly ui: {
+    readonly slot: (claim: { readonly append: "sidebar.content"; readonly render: (input: unknown) => JSX.Element }) => () => void
+  }
+}
+
+function setup(context: V2Context) {
+  return start({
+    options: context.options,
+    preferDatabase: true,
+    colors: () => {
+      const theme = context.theme
+      return {
+        text: theme.text.base,
+        muted: theme.text.muted,
+        error: theme.text.feedback.error.base,
+        warning: theme.text.feedback.warning.base,
+        success: theme.text.feedback.success.base,
+      }
+    },
+    onTurnEnd: (handler) => {
+      const stops = ["session.execution.succeeded", "session.execution.failed"].map((type) =>
+        context.data.on(type, handler),
+      )
+      return () => stops.forEach((stop) => stop())
+    },
+    mount: (render) => context.ui.slot({ append: "sidebar.content", render: () => render() }),
   })
 }
 
-const plugin: TuiPluginModule & { id: string } = {
-  id: "copilot-quota",
+/* -------------------------------------------------------------------------- */
+/* Module                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const plugin: TuiPluginModule & { id: string; setup: typeof setup } = {
+  id: PLUGIN_ID,
   tui,
+  setup,
 }
 
 export default plugin
